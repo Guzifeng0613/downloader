@@ -6,6 +6,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QFileDialog,
     QCheckBox,
     QComboBox,
@@ -19,8 +20,10 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QPlainTextEdit,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QVBoxLayout,
@@ -28,9 +31,10 @@ from PySide6.QtWidgets import (
 )
 
 from config import config
+from downloader.diagnostics import export_diagnostic_bundle
 from downloader.service import DownloadService
 from ui.progress_manager import ProgressManager
-from ui.threads import DownloadTask, ParseTask
+from ui.threads import DownloadTask, ParseTask, RuntimeTask
 
 
 class MainWindow(QMainWindow):
@@ -49,6 +53,16 @@ class MainWindow(QMainWindow):
         "Firefox": "firefox",
     }
 
+    COOKIE_PROFILE_LABELS = {
+        "自动选择": "",
+        "Default": "Default",
+        "Profile 1": "Profile 1",
+        "Profile 2": "Profile 2",
+        "Profile 3": "Profile 3",
+        "Profile 4": "Profile 4",
+        "Profile 5": "Profile 5",
+    }
+
     COOKIE_STATUS_LABELS = {
         "disabled": "未启用 Cookie",
         "available": "Cookie 可读取",
@@ -64,11 +78,13 @@ class MainWindow(QMainWindow):
         self.current_video_info = None
         self.progress_manager = ProgressManager()
         self.service = DownloadService()
+        self.runtime_task = None
         self.output_dir = config.get_download_path()
 
         self._setup_ui()
         self._connect_signals()
         self._refresh_environment_status()
+        self._start_runtime_task("check")
 
     def _setup_ui(self):
         self.setWindowTitle("视频下载器")
@@ -147,8 +163,6 @@ class MainWindow(QMainWindow):
     def _build_settings_panel(self) -> QWidget:
         settings_group = QGroupBox("下载设置")
         settings_group.setObjectName("SettingsPanel")
-        settings_group.setMinimumWidth(330)
-        settings_group.setMaximumWidth(390)
 
         settings_layout = QVBoxLayout(settings_group)
         settings_layout.setContentsMargins(16, 24, 16, 16)
@@ -166,29 +180,64 @@ class MainWindow(QMainWindow):
 
         self.cookie_combo = QComboBox()
         self.cookie_combo.addItems(list(self.COOKIE_LABELS.keys()))
-        self.cookie_combo.setCurrentText("Chrome")
+        self.cookie_combo.setCurrentText("Edge")
         form_layout.addWidget(self._field_label("Cookie"), 1, 0)
         form_layout.addWidget(self.cookie_combo, 1, 1)
+
+        self.cookie_profile_combo = QComboBox()
+        self.cookie_profile_combo.addItems(list(self.COOKIE_PROFILE_LABELS.keys()))
+        form_layout.addWidget(self._field_label("资料档案"), 2, 0)
+        form_layout.addWidget(self.cookie_profile_combo, 2, 1)
 
         self.fragments_spin = QSpinBox()
         self.fragments_spin.setRange(1, 16)
         self.fragments_spin.setValue(config.CONCURRENT_REQUESTS)
-        form_layout.addWidget(self._field_label("并发分片"), 2, 0)
-        form_layout.addWidget(self.fragments_spin, 2, 1)
+        form_layout.addWidget(self._field_label("并发分片"), 3, 0)
+        form_layout.addWidget(self.fragments_spin, 3, 1)
 
         self.delay_spin = QSpinBox()
         self.delay_spin.setRange(0, 5)
         self.delay_spin.setValue(0)
         self.delay_spin.setSuffix(" 秒")
-        form_layout.addWidget(self._field_label("请求延迟"), 3, 0)
-        form_layout.addWidget(self.delay_spin, 3, 1)
+        form_layout.addWidget(self._field_label("请求延迟"), 4, 0)
+        form_layout.addWidget(self.delay_spin, 4, 1)
 
         self.candidate_combo = QComboBox()
         self.candidate_combo.setMinimumWidth(220)
         self.candidate_combo.setEnabled(False)
-        form_layout.addWidget(self._field_label("候选资源"), 4, 0)
-        form_layout.addWidget(self.candidate_combo, 4, 1)
+        form_layout.addWidget(self._field_label("候选资源"), 5, 0)
+        form_layout.addWidget(self.candidate_combo, 5, 1)
         settings_layout.addLayout(form_layout)
+
+        browser_row = QHBoxLayout()
+        self.browser_mode_combo = QComboBox()
+        self.browser_mode_combo.addItem("失败时使用专用 Edge", "fallback")
+        self.browser_mode_combo.addItem("关闭浏览器辅助", "disabled")
+        browser_row.addWidget(self.browser_mode_combo, 1)
+        self.browser_login_btn = QPushButton("打开登录")
+        browser_row.addWidget(self.browser_login_btn)
+        settings_layout.addLayout(browser_row)
+
+        self.live_start_combo = QComboBox()
+        self.live_start_combo.addItem("直播: 从当前开始", "current")
+        self.live_start_combo.addItem("直播: 支持时从头开始", "beginning")
+        self.live_start_combo.setEnabled(False)
+        settings_layout.addWidget(self.live_start_combo)
+
+        self.wait_live_check = QCheckBox("等待预约直播开播")
+        self.wait_live_check.setEnabled(False)
+        settings_layout.addWidget(self.wait_live_check)
+
+        self.playlist_all_check = QCheckBox("选择播放列表全部条目")
+        self.playlist_all_check.setChecked(True)
+        self.playlist_all_check.setVisible(False)
+        settings_layout.addWidget(self.playlist_all_check)
+
+        self.playlist_items_list = QListWidget()
+        self.playlist_items_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.playlist_items_list.setMaximumHeight(120)
+        self.playlist_items_list.setVisible(False)
+        settings_layout.addWidget(self.playlist_items_list)
 
         path_box = QFrame()
         path_box.setObjectName("PathBox")
@@ -229,6 +278,27 @@ class MainWindow(QMainWindow):
         self.env_label.setObjectName("EnvStatus")
         self.env_label.setWordWrap(True)
         settings_layout.addWidget(self.env_label)
+        runtime_row = QHBoxLayout()
+        self.runtime_check_btn = QPushButton("检查更新")
+        self.runtime_repair_btn = QPushButton("安装/修复")
+        runtime_row.addWidget(self.runtime_check_btn)
+        runtime_row.addWidget(self.runtime_repair_btn)
+        settings_layout.addLayout(runtime_row)
+
+        self.runtime_progress_label = QLabel("")
+        self.runtime_progress_label.setObjectName("RuntimeProgressLabel")
+        self.runtime_progress_label.setWordWrap(True)
+        self.runtime_progress_label.setVisible(False)
+        settings_layout.addWidget(self.runtime_progress_label)
+
+        self.runtime_progress = QProgressBar()
+        self.runtime_progress.setObjectName("RuntimeProgress")
+        self.runtime_progress.setRange(0, 100)
+        self.runtime_progress.setValue(0)
+        self.runtime_progress.setTextVisible(True)
+        self.runtime_progress.setMinimumHeight(18)
+        self.runtime_progress.setVisible(False)
+        settings_layout.addWidget(self.runtime_progress)
         settings_layout.addStretch(1)
 
         self.download_btn = QPushButton("开始下载")
@@ -237,7 +307,15 @@ class MainWindow(QMainWindow):
         self.download_btn.setEnabled(False)
         settings_layout.addWidget(self.download_btn)
 
-        return settings_group
+        scroll = QScrollArea()
+        scroll.setObjectName("SettingsScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setMinimumWidth(350)
+        scroll.setMaximumWidth(410)
+        scroll.setWidget(settings_group)
+        return scroll
 
     def _build_content_panel(self) -> QWidget:
         content = QWidget()
@@ -278,6 +356,9 @@ class MainWindow(QMainWindow):
         self.diagnostic_text.setMinimumHeight(145)
         self.diagnostic_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         diag_layout.addWidget(self.diagnostic_text, 1)
+        self.export_diag_btn = QPushButton("导出脱敏诊断包")
+        self.export_diag_btn.setEnabled(False)
+        diag_layout.addWidget(self.export_diag_btn)
         content_layout.addWidget(diag_group, 1)
 
         progress_group = QGroupBox("下载进度")
@@ -503,6 +584,23 @@ class MainWindow(QMainWindow):
                 background: #1f8f72;
                 border-color: #24b891;
             }
+            QLabel#RuntimeProgressLabel {
+                color: #b9c6cf;
+                font-size: 12px;
+            }
+            QProgressBar#RuntimeProgress {
+                background: #0d1318;
+                border: 1px solid #273640;
+                border-radius: 6px;
+                color: #f3f7f8;
+                font-size: 11px;
+                font-weight: 700;
+                text-align: center;
+            }
+            QProgressBar#RuntimeProgress::chunk {
+                background: #1f8f72;
+                border-radius: 5px;
+            }
             QStatusBar {
                 background: #0f1418;
                 border-top: 1px solid #1f2a32;
@@ -570,19 +668,186 @@ class MainWindow(QMainWindow):
         self.download_btn.clicked.connect(self._on_download_clicked)
         self.choose_dir_btn.clicked.connect(self._on_choose_dir_clicked)
         self.url_input.returnPressed.connect(self._on_parse_clicked)
+        self.cookie_combo.currentTextChanged.connect(self._on_cookie_browser_changed)
+        self.browser_login_btn.clicked.connect(self._on_browser_login_clicked)
+        self.runtime_check_btn.clicked.connect(lambda: self._start_runtime_task("check"))
+        self.runtime_repair_btn.clicked.connect(self._confirm_runtime_install)
+        self.playlist_all_check.toggled.connect(self._on_playlist_all_toggled)
+        self.export_diag_btn.clicked.connect(self._on_export_diagnostics)
 
         self.progress_manager.progress_updated.connect(self._on_progress_updated)
         self.progress_manager.task_completed.connect(self._on_task_completed)
         self.progress_manager.task_error.connect(self._on_task_error)
 
+        self._on_cookie_browser_changed(self.cookie_combo.currentText())
+
+    def _on_cookie_browser_changed(self, label: str):
+        browser = self.COOKIE_LABELS.get(label, "none")
+        supports_profile = browser in {"chrome", "edge", "firefox"}
+        self.cookie_profile_combo.setEnabled(supports_profile)
+        if not supports_profile:
+            self.cookie_profile_combo.setCurrentText("自动选择")
+
     def _refresh_environment_status(self):
-        ffmpeg_path = self.service.get_ffmpeg_path()
-        if ffmpeg_path:
-            self.env_label.setText(f"ffmpeg: 已检测到 ({ffmpeg_path})")
-            self._set_label_tone(self.env_label, "success")
+        statuses = self.service.runtime_manager.statuses()
+        browser = self.service.browser_manager.status()
+        parts = []
+        healthy = True
+        for name in ("yt-dlp", "ffmpeg", "deno"):
+            item = statuses[name]
+            state = item.version or item.message
+            parts.append(f"{name}: {state}")
+            healthy = healthy and item.healthy
+        parts.append(f"Edge: {browser.message}")
+        self.env_label.setText("\n".join(parts))
+        self._set_label_tone(self.env_label, "success" if healthy and browser.edge_available else "warning")
+
+    def _start_runtime_task(self, action: str):
+        if self.runtime_task and self.runtime_task.isRunning():
+            return
+        self.runtime_check_btn.setEnabled(False)
+        self.runtime_repair_btn.setEnabled(False)
+        self.runtime_progress_label.setVisible(True)
+        self.runtime_progress.setVisible(True)
+        self.runtime_progress_label.setText(
+            "正在检查运行时更新..." if action == "check" else "正在准备运行时更新..."
+        )
+        self.runtime_progress.setRange(0, 0)
+        self.runtime_progress.setFormat("")
+        self.runtime_task = RuntimeTask(action)
+        self.runtime_task.signals.finished.connect(
+            lambda data, current_action=action: self._on_runtime_task_finished(current_action, data)
+        )
+        self.runtime_task.signals.progress.connect(self._on_runtime_task_progress)
+        self.runtime_task.signals.error.connect(self._on_runtime_task_error)
+        self.runtime_task.start()
+
+    def _on_runtime_task_progress(self, data: dict):
+        message = str(data.get("message") or "正在更新运行时...")
+        completed = int(data.get("downloaded") or 0)
+        total = int(data.get("total") or 0)
+        if completed and total:
+            message += f"  {self._format_bytes(completed)} / {self._format_bytes(total)}"
+        self.runtime_progress_label.setText(message)
+        if data.get("indeterminate"):
+            self.runtime_progress.setRange(0, 0)
+            self.runtime_progress.setFormat("")
         else:
-            self.env_label.setText("ffmpeg: 未检测到。高清合并、HLS/DASH 下载可能失败。")
-            self._set_label_tone(self.env_label, "warning")
+            percent = int(data.get("percent") or 0)
+            self.runtime_progress.setRange(0, 100)
+            self.runtime_progress.setValue(max(0, min(100, percent)))
+            self.runtime_progress.setFormat(f"{percent}%")
+
+    def _on_runtime_task_finished(self, action: str, data: dict):
+        if self.runtime_task:
+            self.runtime_task.wait(1000)
+            self.runtime_task = None
+        self.runtime_check_btn.setEnabled(True)
+        self.runtime_repair_btn.setEnabled(True)
+        lines = []
+        updates = []
+        for name in ("yt-dlp", "ffmpeg", "deno"):
+            item = data.get(name, {})
+            state = item.get("version") or item.get("message") or "未知"
+            if item.get("update_available"):
+                updates.append(f"{name} {item['update_available']}")
+                state += f" -> {item['update_available']}"
+            lines.append(f"{name}: {state}")
+        browser = self.service.browser_manager.status()
+        lines.append(f"Edge: {browser.message}")
+        self.env_label.setText("\n".join(lines))
+        healthy = all(data.get(name, {}).get("healthy") for name in ("yt-dlp", "ffmpeg", "deno"))
+        self._set_label_tone(self.env_label, "success" if healthy else "warning")
+        self.runtime_progress.setRange(0, 100)
+        self.runtime_progress.setValue(100)
+        self.runtime_progress.setFormat("100%")
+        self.runtime_progress_label.setText(
+            "运行时更新完成" if action == "install" else "运行时更新检查完成"
+        )
+        if action == "check" and updates:
+            answer = QMessageBox.question(
+                self,
+                "运行时更新",
+                "检测到可安装或可更新组件：\n" + "\n".join(updates) + "\n\n现在安装吗？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer == QMessageBox.Yes:
+                self._start_runtime_task("install")
+
+    def _on_runtime_task_error(self, error: str):
+        if self.runtime_task:
+            self.runtime_task.wait(1000)
+            self.runtime_task = None
+        self.runtime_check_btn.setEnabled(True)
+        self.runtime_repair_btn.setEnabled(True)
+        self.env_label.setText(f"运行时操作失败: {error}")
+        self._set_label_tone(self.env_label, "error")
+        self.runtime_progress.setRange(0, 100)
+        self.runtime_progress.setValue(0)
+        self.runtime_progress.setFormat("失败")
+        self.runtime_progress_label.setText("运行时更新失败")
+
+    def _confirm_runtime_install(self):
+        answer = QMessageBox.question(
+            self,
+            "安装或修复运行时",
+            "将从官方来源下载并校验 yt-dlp、ffmpeg/ffprobe 和 Deno。继续吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer == QMessageBox.Yes:
+            self._start_runtime_task("install")
+
+    def _on_browser_login_clicked(self):
+        try:
+            self.service.browser_manager.open_login(
+                self.url_input.text().strip() or "https://www.microsoft.com/"
+            )
+            self._refresh_environment_status()
+        except Exception as exc:
+            QMessageBox.warning(self, "Edge 登录", str(exc))
+
+    def _on_export_diagnostics(self):
+        target, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出脱敏诊断包",
+            str(self.output_dir / "video-downloader-diagnostics.zip"),
+            "ZIP 文件 (*.zip)",
+        )
+        if not target:
+            return
+        try:
+            metadata = self.current_video_info or {}
+            export_diagnostic_bundle(
+                target,
+                components=self.service.runtime_manager.describe(),
+                attempts=metadata.get("attempts", []),
+                summary=metadata.get("diagnostic_summary", self.diagnostic_text.toPlainText()),
+                log=metadata.get("diagnostic_log", ""),
+                extra={
+                    "resource_kind": metadata.get("resource_kind", ""),
+                    "is_live": metadata.get("is_live", False),
+                    "playlist_count": metadata.get("playlist_count", 0),
+                },
+            )
+            QMessageBox.information(self, "诊断包", f"已导出到:\n{target}")
+        except Exception as exc:
+            QMessageBox.warning(self, "诊断包", f"导出失败: {exc}")
+
+    def _on_playlist_all_toggled(self, checked: bool):
+        if checked:
+            self.playlist_items_list.selectAll()
+        else:
+            self.playlist_items_list.clearSelection()
+
+    def _format_bytes(self, value: int) -> str:
+        size = float(max(0, value))
+        for unit in ("B", "KB", "MB", "GB"):
+            if size < 1024 or unit == "GB":
+                return f"{size:.1f} {unit}"
+            size /= 1024
+        return f"{size:.1f} GB"
 
     def _on_choose_dir_clicked(self):
         selected = QFileDialog.getExistingDirectory(self, "选择保存目录", str(self.output_dir))
@@ -614,15 +879,18 @@ class MainWindow(QMainWindow):
         self._set_label_tone(self.attempts_label, "warning")
         self.diagnostic_text.clear()
         self._populate_candidate_combo([])
+        self.service.browser_manager.close()
 
         self.parse_task = ParseTask(
             url=url,
             cookie_browser=self._cookie_browser(),
+            cookie_profile=self._cookie_profile(),
             concurrent_fragments=self.fragments_spin.value(),
             download_playlist=self.playlist_check.isChecked(),
             diagnostic_mode=self.diagnostic_check.isChecked(),
             dynamic_scan_enabled=self.dynamic_scan_check.isChecked(),
             request_delay_seconds=float(self.delay_spin.value()),
+            browser_assist_mode=str(self.browser_mode_combo.currentData() or "fallback"),
         )
         self.parse_task.signals.finished.connect(self._on_parse_finished)
         self.parse_task.signals.error.connect(self._on_parse_error)
@@ -641,6 +909,8 @@ class MainWindow(QMainWindow):
         formats = data.get("formats", [])
         candidates = data.get("candidates", [])
         warning = data.get("warning", "")
+        resource_kind = data.get("resource_kind", "video")
+        playlist_count = int(data.get("playlist_count") or 0)
 
         info_text = (
             f"<span style='font-size:18px; font-weight:700; color:{self.COLOR_TEXT};'>"
@@ -649,9 +919,17 @@ class MainWindow(QMainWindow):
         info_text += (
             f"<span style='color:{self.COLOR_MUTED};'>"
             f"作者: {self._escape(uploader)} &nbsp;|&nbsp; 时长: {duration}<br>"
-            f"平台: {self._escape(extractor)} &nbsp;|&nbsp; 可用格式: {len(formats)}"
+            f"平台: {self._escape(extractor)} &nbsp;|&nbsp; 类型: {self._escape(resource_kind)}"
+            f" &nbsp;|&nbsp; 可用格式: {len(formats)}"
             f"</span>"
         )
+        if playlist_count:
+            info_text += f"<br><span style='color:{self.COLOR_TEXT};'>播放列表条目: {playlist_count}</span>"
+        if data.get("is_live"):
+            info_text += (
+                f"<br><span style='color:{self.COLOR_TEXT};'>直播状态: "
+                f"{self._escape(data.get('live_status') or 'live')}</span>"
+            )
         if data.get("requires_ffmpeg") and not data.get("ffmpeg_available"):
             info_text += f"<br><span style='color:{self.COLOR_WARNING};'>需要 ffmpeg，当前未检测到。</span>"
         if warning:
@@ -663,7 +941,13 @@ class MainWindow(QMainWindow):
 
         self._populate_quality_combo(formats)
         self._populate_candidate_combo(candidates)
-        self.download_btn.setEnabled(bool(formats) and not data.get("restriction_status"))
+        self._populate_playlist_items(data.get("playlist_entries", []))
+        is_live = bool(data.get("is_live"))
+        self.live_start_combo.setEnabled(is_live)
+        self.wait_live_check.setEnabled(is_live)
+        if playlist_count:
+            self.playlist_check.setChecked(True)
+        self.download_btn.setEnabled(bool(formats or playlist_count) and not data.get("restriction_status"))
         self._set_activity_state(f"解析完成 {len(formats)} 格式", "success")
 
         cookie_label = self.COOKIE_STATUS_LABELS.get(data.get("cookie_status", ""), data.get("cookie_status", "未知"))
@@ -677,6 +961,7 @@ class MainWindow(QMainWindow):
         if not diagnostic:
             diagnostic = "没有额外诊断日志。"
         self.diagnostic_text.setPlainText(diagnostic)
+        self.export_diag_btn.setEnabled(True)
 
     def _on_parse_error(self, error: str):
         self.parse_btn.setEnabled(True)
@@ -691,13 +976,23 @@ class MainWindow(QMainWindow):
         self.cookie_status_label.setText("Cookie 状态: -")
         self._set_label_tone(self.cookie_status_label, "muted")
         self.diagnostic_text.setPlainText(error or "解析失败")
+        self.export_diag_btn.setEnabled(True)
         self._populate_candidate_combo([])
+        self._populate_playlist_items([])
 
     def _on_download_clicked(self):
         if not self.current_video_info:
             return
 
-        url = self.current_video_info.get("source_url") or self.url_input.text().strip().strip("'\"")
+        if (
+            self.playlist_items_list.isVisible()
+            and not self.playlist_all_check.isChecked()
+            and not self.playlist_items_list.selectedItems()
+        ):
+            QMessageBox.warning(self, "播放列表", "请至少选择一个播放列表条目。")
+            return
+
+        url = self.url_input.text().strip().strip("'\"")
         title = self.current_video_info.get("title", "video")
         quality = self.quality_combo.currentText()
         task_id = f"task_{len(self.download_tasks)}"
@@ -717,13 +1012,18 @@ class MainWindow(QMainWindow):
             output_dir=str(self.output_dir),
             quality=quality,
             cookie_browser=self._cookie_browser(),
+            cookie_profile=self._cookie_profile(),
             concurrent_fragments=self.fragments_spin.value(),
             download_playlist=self.playlist_check.isChecked(),
             overwrite=self.overwrite_check.isChecked(),
             diagnostic_mode=self.diagnostic_check.isChecked(),
             dynamic_scan_enabled=self.dynamic_scan_check.isChecked(),
             request_delay_seconds=float(self.delay_spin.value()),
-            candidate_url=self._selected_candidate_url(),
+            candidate_ref=self._selected_candidate_ref(),
+            browser_assist_mode=str(self.browser_mode_combo.currentData() or "fallback"),
+            live_start=str(self.live_start_combo.currentData() or "current"),
+            wait_for_live=self.wait_live_check.isChecked(),
+            playlist_items=self._selected_playlist_items(),
         )
         task.signals.started.connect(self._on_download_started)
         task.signals.progress.connect(self._on_download_progress)
@@ -765,7 +1065,14 @@ class MainWindow(QMainWindow):
 
     def _reset_download_button(self):
         self.download_btn.setText("开始下载")
-        self.download_btn.setEnabled(bool(self.current_video_info) and not self.current_video_info.get("restriction_status"))
+        available = bool(
+            self.current_video_info
+            and (
+                self.current_video_info.get("formats")
+                or self.current_video_info.get("playlist_count")
+            )
+        )
+        self.download_btn.setEnabled(available and not self.current_video_info.get("restriction_status"))
 
     def _on_progress_updated(self, task_id: str, data: dict):
         for i in range(self.progress_list.count()):
@@ -833,11 +1140,37 @@ class MainWindow(QMainWindow):
 
         self.candidate_combo.addItem("自动选择", "")
         for candidate in candidates:
-            self.candidate_combo.addItem(candidate.get("display_name", candidate.get("url", "")), candidate.get("url", ""))
+            self.candidate_combo.addItem(
+                candidate.get("display_name", candidate.get("url", "")),
+                candidate.get("candidate_ref", ""),
+            )
         self.candidate_combo.setEnabled(True)
 
-    def _selected_candidate_url(self) -> str:
+    def _selected_candidate_ref(self) -> str:
         return str(self.candidate_combo.currentData() or "")
+
+    def _populate_playlist_items(self, entries):
+        self.playlist_items_list.clear()
+        visible = bool(entries)
+        self.playlist_all_check.setVisible(visible)
+        self.playlist_items_list.setVisible(visible)
+        for entry in entries:
+            item = QListWidgetItem(
+                f"{entry.get('index', '')}. {entry.get('title', '未命名条目')}"
+            )
+            item.setData(Qt.UserRole, str(entry.get("index", "")))
+            self.playlist_items_list.addItem(item)
+            item.setSelected(True)
+        self.playlist_all_check.setChecked(True)
+
+    def _selected_playlist_items(self) -> list[str]:
+        if not self.playlist_items_list.isVisible() or self.playlist_all_check.isChecked():
+            return []
+        return [
+            str(item.data(Qt.UserRole))
+            for item in self.playlist_items_list.selectedItems()
+            if item.data(Qt.UserRole)
+        ]
 
     def _attempts_text(self, attempts):
         if not attempts:
@@ -851,6 +1184,9 @@ class MainWindow(QMainWindow):
     def _cookie_browser(self) -> str:
         return self.COOKIE_LABELS.get(self.cookie_combo.currentText(), "none")
 
+    def _cookie_profile(self) -> str:
+        return self.COOKIE_PROFILE_LABELS.get(self.cookie_profile_combo.currentText(), "")
+
     def _escape(self, value) -> str:
         return (
             str(value)
@@ -858,3 +1194,11 @@ class MainWindow(QMainWindow):
             .replace("<", "&lt;")
             .replace(">", "&gt;")
         )
+
+    def closeEvent(self, event):
+        for task in list(self.download_tasks.values()):
+            task.cancel()
+        if hasattr(self, "parse_task") and self.parse_task.isRunning():
+            self.parse_task.service.cancel()
+        self.service.browser_manager.close()
+        super().closeEvent(event)

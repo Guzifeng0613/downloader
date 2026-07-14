@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+*.part
+*.ytdl
+downloads/
+.pytest_cache/

@@ -130,11 +130,8 @@ class Config:
         ],
     }
 
-    # ffmpeg 可能存在的路径
-    FFMPEG_POSSIBLE_PATHS = [
-        "~/AppData/Local/Microsoft/WinGet/Packages/Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe/ffmpeg-8.1-full_build/bin/ffmpeg.exe",
-        "C:/Users/39187/AppData/Local/Microsoft/WinGet/Packages/Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe/ffmpeg-8.1-full_build/bin/ffmpeg.exe",
-    ]
+    # 仅保留可移植发现路径；托管运行时由 RuntimeManager 提供。
+    FFMPEG_POSSIBLE_PATHS = []
 
     @classmethod
     def get_download_path(cls) -> Path:
